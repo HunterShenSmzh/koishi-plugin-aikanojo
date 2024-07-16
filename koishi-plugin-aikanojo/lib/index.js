@@ -4,28 +4,26 @@ const koishi_1 = require("koishi");
 const axios = require("axios");
 const path = require('path');
 const fs = require('fs');
-const util = require('util');
+const cheerio = require('cheerio');
 const { channel } = require("diagnostics_channel");
-const readdir = util.promisify(fs.readdir);
-const readFile = util.promisify(fs.readFile);
-const writeFile = util.promisify(fs.writeFile);
 const HttpsProxyAgent = require('https-proxy-agent');
 const { time } = require("console");
 const { SlowBuffer } = require("buffer");
 const { send, memoryUsage } = require("process");
 const userTimers = new Map();
+const alarms = new Map();
+exports.inject = ['puppeteer', 'database', 'assets'];
 
 exports.name = "aikanojo";
 exports.usage = `
 ### 用前需知
-### 当前为先行版0.9.0
+### 当前为正式版1.0.0
 ### QQ讨论群：719518427
-先行版bug很多，而且功能不全，遇到bug或者有想要的功能，都可以加qq群讨论<br>
-tts部分现在只是摆设<br>
-人设目前只有咕咕白可用<br>
-建议使用dolphin 34b<br>
-原始模型：https://hf-mirror.com/cognitivecomputations/dolphin-2.9.1-yi-1.5-34b<br>
-量化模型：https://hf-mirror.com/LoneStriker/dolphin-2.9.1-yi-1.5-34b-4.65bpw-h6-exl2<br>
+遇到bug或者有想要的功能，都可以加qq群讨论<br>
+注意！插件更新会导致历史记录与默认人设重置，请自行保存相关文档！<br>
+默认的历史记录地址为：<br>
+Koishi\\Desktop\\data\\instances\\default\\node_modules\\koishi-plugin-aikanojo\\lib<br>
+目录下的longtermmemory和sessionData目录。分别保存者长期记忆和短期记忆和状态数据<br>
 
 完成功能:<br>
 时间轴√<br>
@@ -38,17 +36,35 @@ tts部分现在只是摆设<br>
 -与对话者的关系√<br>
 优化切分逻辑和延时√<br>
 优化状态栏显示√<br>
-添加动作区块<br>
-添加长期记忆切分与读取<br>
+添加动作区块√<br>
+添加长期记忆切分与读取√<br>
+语音系统√<br>
+支持更多人设√<br>
+工具调用√<br>
+表情包√<br>
+档案存储功能√<br>
 
 ToDo:<br>
-支持更多人设<br>
-重构代码，优化逻辑流程<br>
+world book系统<br>
+正经的RAG长期记忆系统<br>
+
+修复:<br>
+修复at回复不生效的问题。小修小补了一些。<br>
 
 TGW后台需要自行部署<br>
-github上有一键安装包，包含Windows，Linux，Mac。https://github.com/oobabooga/text-generation-webui<br>
+github上有一键安装包，包含Windows，Linux，Mac。<br>
+https://github.com/oobabooga/text-generation-webui<br>
 也可以直接使用我制作的一键懒人包：https://www.bilibili.com/video/BV1Te411U7me<br>
 
+支持使用Vits语音输出回复，需要加载任意tts插件比如open-vits插件，或者直接使用内置接口。<br>
+可以通过编辑设置中的指令开头，来调整使用的插件格式。比如openvits插件就可以直接用：say<br>
+open-vits插件：https://github.com/initialencounter/koishi-plugin-open-vits#readme<br>
+自建vits后端：https://github.com/Artrajz/vits-simple-api<br>
+
+推荐模型：<br>
+强烈推荐(本插件以其为基础测试制作)：Gemma2 27b<br>
+dolphine yi 1.5 34b<br>
+yi 1.5 34b<br>
 `;
 
 exports.Config = koishi_1.Schema.intersect([
@@ -100,6 +116,55 @@ exports.Config = koishi_1.Schema.intersect([
             .default('咕咕白'),
     }).description('基础设置'),
     koishi_1.Schema.object({
+        UseTool: koishi_1.Schema.boolean()
+            .description('开启工具调用')
+            .default(false),
+        UseTool_fullreply: koishi_1.Schema.boolean()
+            .description('发送精确数据')
+            .default(false),
+        Google_Proxy: koishi_1.Schema.string()
+            .description('谷歌搜索引擎的代理地址，默认本地clash')
+            .default('http://127.0.0.1:7890'),
+        UseTool_Picture: koishi_1.Schema.boolean()
+            .description('发送网页图片(需要开启全局代理，只能获取维基百科图片，谨慎开启，建议配合下面的屏蔽词)')
+            .default(false),
+        dangerous_search_keywords: koishi_1.Schema.array(koishi_1.Schema.string())
+            .description('屏蔽关键词(检索内容只要包含了以下内容就无法进行搜索)')
+            .default(['超级北极熊'])
+            .collapse(true),
+        search_keywords: koishi_1.Schema.array(koishi_1.Schema.string())
+            .description('触发搜索的关键词(在模型判断需要搜索且用户输入包含如下内容时，搜索生效)')
+            .default(['搜索', '检索', '找', '搜', '查', '上网', '详细知识', '详细信息', '链接'])
+            .collapse(true),
+        UseTool_reply: koishi_1.Schema.boolean()
+            .description('显示调用工具判断(Debug模式)')
+            .default(false)
+    }).description('工具调用相关设定'),
+    koishi_1.Schema.object({
+        UseEmoji: koishi_1.Schema.boolean()
+            .description('开启表情包调用')
+            .default(false),
+        Emoji_Path: koishi_1.Schema.string()
+            .description('表情包本地路径(留空就用内置)')
+            .default(''),
+        Emoji_reply: koishi_1.Schema.boolean()
+            .description('显示调用判断')
+            .default(false)
+    }).description('表情包相关设定'),
+    koishi_1.Schema.object({
+        Archive_Path: koishi_1.Schema.string()
+            .description('档案文件夹本地路径(留空就用内置)')
+            .default('')
+    }).description('档案文件夹相关设定'),
+    koishi_1.Schema.object({
+        outputMode: koishi_1.Schema.union([
+            koishi_1.Schema.const('text').description('只返回文字'),
+            koishi_1.Schema.const('voice').description('只返回语音'),
+            koishi_1.Schema.const('both').description('同时返回语音与文字'),
+            koishi_1.Schema.const('extra').description('同时返回语音与文字(使用内置独立语音接口)'),
+        ])
+            .description('输出模式')
+            .default('text'),
         ttscommand: koishi_1.Schema.string()
             .description('对接插件使用的指令(如果是对接其他语音插件只需要填写这个，下面的都不用管)')
             .default('say'),
@@ -149,8 +214,8 @@ exports.Config = koishi_1.Schema.intersect([
             .default(0),
         presence_penalty: koishi_1.Schema.number().description('presence_penalty')
             .default(0),
-        stop: koishi_1.Schema.string().description('stop')
-            .default("\n\n\n"),
+        stop: koishi_1.Schema.array(koishi_1.Schema.string())
+            .default(["以下是"]),
         top_p: koishi_1.Schema.number().description('top_p')
             .default(0.9),
         min_p: koishi_1.Schema.number().description('min_p')
@@ -373,7 +438,7 @@ function createMemory(id) {
 }
 
 //读取并写入基础状态
-function writeState(id, character ,time) {
+function writeBaseState(id, character ,time) {
     let safeId = encodeURIComponent(id);
     let filePath = path.join(__dirname, 'sessionData', `${safeId}-state.json`);
     let statefilePath = path.join(__dirname, 'characters', `${character}-state.json`);
@@ -519,6 +584,17 @@ function getAllStates(id) {
     }
 }
 
+//获取原始state数据
+function getOriginStates(character) {
+    let filePath = path.join(__dirname, 'characters', `${character}-state.json`);
+    if (fs.existsSync(filePath)) {
+        let stateData = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        return stateData;
+    } else {
+        return null;
+    }
+}
+
 //获取长期记忆
 async function readMemory(id) {
     let safeId = encodeURIComponent(id);
@@ -601,6 +677,71 @@ function getTime() {
     return year + '年' + month + '月' + date + '日' + hours + ':' + minutes + ':' + seconds;
 }
 
+//设置闹钟
+function setAlarm(id, time, callback) {
+    if (alarms.has(id)) {
+        console.error(`Alarm with id ${id} already exists.`);
+        return;
+    }
+
+    const now = new Date();
+    const normalizedTime = time.replace('：', ':');
+    const timeParts = normalizedTime.split(':');
+
+    if (timeParts.length !== 2) {
+        console.error('Invalid time format. Please use HH:MM format.');
+        return;
+    }
+
+    const [hour, minute] = timeParts.map(Number);
+
+    if (isNaN(hour) || isNaN(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        console.error('Invalid time format. Please use HH:MM format with valid hour and minute.');
+        return;
+    }
+
+    const alarmTime = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0, 0);
+
+    if (alarmTime <= now) {
+        alarmTime.setDate(alarmTime.getDate() + 1);
+    }
+
+    const timeDifference = alarmTime - now;
+
+    const timerId = setTimeout(async () => {
+        await callback();
+        alarms.delete(id);
+    }, timeDifference);
+
+    alarms.set(id, timerId);
+    console.log(`Alarm with id ${id} set for ${alarmTime}.`);
+}
+
+//取消闹钟
+function cancelAlarm(id) {
+    if (alarms.has(id)) {
+        clearTimeout(alarms.get(id));
+        alarms.delete(id);
+        console.log(`Alarm with id ${id} has been cancelled.`);
+    } else {
+        console.error(`No alarm found with id ${id}.`);
+    }
+}
+
+//取消用户所有闹钟
+function cancelUserAlarms(sessionId) {
+    const alarmsToDelete = [];
+    for (let [id, timerId] of alarms.entries()) {
+        if (id.startsWith(sessionId + '-')) {
+            clearTimeout(timerId);
+            alarmsToDelete.push(id);
+        }
+    }
+        for (let id of alarmsToDelete) {
+        alarms.delete(id);
+    }
+}
+
 //转化对话记录
 function formatDialogue(dialogue, NameA, NameB) {
     let result = '';
@@ -652,7 +793,7 @@ async function IntentionJudge(url, message, history, NameA, NameB,config) {
     }
 
     let dialogue = formatDialogue(Inthistory, NameA, NameB);
-    character.push({ "role": "user", "content": dialogue })
+    character.push({ "role": "user", "content": `请你判断对话的意图，然后将其尽可能以简洁干练的语言进行总结。这里是你需要判断意图的文本：\n` + dialogue });
 
     // 准备request
     const customRequest = {
@@ -664,8 +805,55 @@ async function IntentionJudge(url, message, history, NameA, NameB,config) {
     //post request
     let response = await axios.post(url, request);
     if (response.status == 200) {
-        let output = response.data.choices[0].message.content
+        let output = response.data.choices[0].message.content.replace(/\n\s*\n/g, '\n');
         return output
+    } else {
+        console.log("API请求失败，请检查服务器状态。")
+    }
+}
+
+//Emoji判断
+async function EmojiJudge(url, message, message2, config, session) {
+    let character = getCharacter('EmojiJudge', 'buildincharacters');
+    //准备内容
+    let usermessage = { "role": "user", "content": message };
+    let assistantmessage = { "role": "assistant", "content": message2 };
+    let Inthistory = [usermessage].concat(assistantmessage);
+
+    let dialogue = formatDialogue(Inthistory, 'A', 'B');
+    character.push({ "role": "user", "content": `请你判断对话的情感基调，然后判断是否需要配一张表情包。这里是你需要判断的对话：\n` + dialogue });
+
+    // 准备request
+    const customRequest = {
+        "messages": character,
+        "temperature": 0.4,
+        "max_tokens": 50,
+        "stop": ["\n"],
+    };
+    const request = createRequestBody(config, customRequest)
+    //post request
+    let response = await axios.post(url, request);
+    if (response.status == 200) {
+        let output = response.data.choices[0].message.content.replace(/\n\s*\n/g, '');
+        let regex = /\[(.*?)\]/g; 
+        let match = regex.exec(output);
+
+        if (match[1] !== "None") {
+            const basePath = config.Emoji_Path ? config.Emoji_Path.replace(/\\/g, '/') : path.resolve(__dirname, 'Emoji');
+            const filePath = path.resolve(basePath, `${match[1]}.png`);
+            // 检查文件是否存在
+            if (fs.existsSync(filePath)) {
+                const fileURL = `file://${filePath.replace(/\\/g, '/')}`;
+                await session.send(`<img src="${fileURL}"/>`);
+                if (config.Emoji_reply) {
+                    await session.send(match[1])
+                }
+            } else {
+                await session.send(`${match[1]}.png图片文件不存在。`);
+            }
+        } else {
+            return
+        }
     } else {
         console.log("API请求失败，请检查服务器状态。")
     }
@@ -673,22 +861,11 @@ async function IntentionJudge(url, message, history, NameA, NameB,config) {
 
 // 修复引号和逗号的函数
 function fixJSONFormat(str) {
-    // 1. 去掉前后空白
     str = str.trim();
-
-    // 2. 修复缺少的引号
     str = str.replace(/:\s*([a-zA-Z0-9_$]+)/g, ': "$1"');
-
-    // 3. 修复缺少的逗号
     str = str.replace(/"\s*([^"]+?)\n/g, '"$1",\n');
-
-    // 4. 修复多余的引号
     str = str.replace(/"([^"]+?)""/g, '"$1"');
-
-    // 5. 修复逗号问题（缺少逗号的地方添加逗号）
     str = str.replace(/([a-zA-Z0-9_$"])\n\s*([a-zA-Z0-9_$"])/g, '$1,\n$2');
-
-    // 6. 修复末尾的多余逗号
     str = str.replace(/,\s*([}\]])/g, '$1');
 
     return str;
@@ -705,6 +882,25 @@ function isValidFavorability(value) {
         return true;
     }
     return false;
+}
+
+//修改好感度
+function updateFavorability(jsonStr) {
+    let jsonObject;
+    try {
+        jsonObject = JSON.parse(jsonStr);
+    } catch (error) {
+        return jsonStr;
+    }
+
+    if (jsonObject.hasOwnProperty("好感度") && typeof jsonObject["好感度"] === 'string') {
+        let result = isValidFavorability(jsonObject["好感度"]);
+        if (result !== true) {
+            jsonObject["好感度"] = result;
+        }
+    }
+
+    return JSON.stringify(jsonObject);
 }
 
 // 检查值是否包含中文字符且长度不小于2的函数
@@ -765,9 +961,9 @@ function fixJSONFormatWithOrder(str,OldstateData) {
 }
 
 //状态栏计算
-async function status_bar(url, character, history, message, userName, IntJudge, IntThink, OldstateData, config, session) {
+async function status_bar(url, character, history, message, userName, IntJudge, IntThink, OldstateData, config, session, summarize,Action) {
 
-    let prompt = `我是咕咕白，是一个女大学生。
+    let prompt = `${summarize}
 当前穿着：${OldstateData.clothes}
 当前位置：${OldstateData.location}
 当前心情：${OldstateData.emotion}
@@ -777,6 +973,8 @@ async function status_bar(url, character, history, message, userName, IntJudge, 
 ${IntJudge}
 以下是我看到消息后的内心思考:
 ${IntThink}
+以下是我看到消息后做出的动作：
+${Action}
 以下是我在看到消息前，输出的标准json格式数值(好感度最高每次增减5)：
 {
     "穿着": "${OldstateData.clothes}",
@@ -787,7 +985,8 @@ ${IntThink}
 }
 以下是我在看到消息后，输出的标准json格式数值(好感度最高每次增减5)：
 `
-    let input = character.concat({ "role": "user", "content": message })
+    let Inthistory = history.concat({ "role": "user", "content": message });
+    let input = character.concat(Inthistory);
     input.push({ "role": "assistant", "content": prompt }); 
     // 准备request
     const customRequest = {
@@ -804,8 +1003,9 @@ ${IntThink}
         let output = response.data.choices[0].message.content.replace(/\n\s*\n/g, '\n');
         let result = output.split(`以下是我在看到消息后，输出的标准json格式数值(好感度最高每次增减5)`)[1];
         //尝试修复
-        let fixedresult = fixJSONFormatWithOrder(result + '}', OldstateData)
-        let results = JSON.parse(fixedresult);
+        let fixedresult = fixJSONFormatWithOrder(result + '}', OldstateData);
+        let newfixedresult = updateFavorability(fixedresult)
+        let results = JSON.parse(newfixedresult);
         if (config.show_state_bar) {
             let formattedResult = `状态栏:
 | 穿着: ${results["穿着"]} |
@@ -824,7 +1024,7 @@ ${IntThink}
 
 
 //内心思考
-async function InternalThinking(url, character, history, message, IntJudge, session, config, OldstateData) {
+async function InternalThinking(url, character, history, message, IntJudge, session, config, OldstateData, summarize) {
     //获取相关参数
     const Time = getTime();
 
@@ -838,7 +1038,7 @@ async function InternalThinking(url, character, history, message, IntJudge, sess
 
     let fullinput = character.concat(Inthistory);
 
-    let Think = `我是咕咕白，是一个女大学生。
+    let Think = `${summarize}
 当前时间：${Time}
 当前穿着：${OldstateData.clothes}
 当前位置：${OldstateData.location}
@@ -877,7 +1077,7 @@ ${IntJudge}
 }
 
 //动作计算
-async function action(url, character, history, message, IntJudge, IntThink, session, config, OldstateData) {
+async function action(url, character, history, message, IntJudge, IntThink, session, config, OldstateData, summarize, characterName) {
     //获取相关参数
     const Time = getTime();
 
@@ -885,7 +1085,7 @@ async function action(url, character, history, message, IntJudge, IntThink, sess
     const Inthistory = history.concat({ "role": "user", "content": message });
     let fullinput = character.concat(Inthistory);
 
-    let Think = `我是咕咕白，是一个女大学生。
+    let Think = `${summarize}
 当前时间：${Time}
 当前穿着：${OldstateData.clothes}
 当前位置：${OldstateData.location}
@@ -896,8 +1096,8 @@ async function action(url, character, history, message, IntJudge, IntThink, sess
 ${IntJudge}
 以下是我看到消息后的内心思考：
 ${IntThink}
-于是我看到消息后做了如下动作(只有我自己的身体动作情况，且动作描写为一整个段落没有换行，例如：咕咕白调整了一下坐姿，拿起手机，发送了一条消息。)：
-咕咕白`;
+于是我看到消息后做了如下动作(只有我自己的身体动作情况，且动作描写为一整个段落没有换行，例如：${characterName}调整了一下坐姿，拿起手机，发送了一条消息。)：
+${characterName}`;
 
     fullinput.push({ "role": "assistant", "content": Think });
 
@@ -914,7 +1114,7 @@ ${IntThink}
     if (response.status == 200) {
         let output = response.data.choices[0].message.content.replace(/\n\s*\n/g, '\n');
 
-        let sendoutput = output.split(`于是我看到消息后做了如下动作(只有我自己的身体动作情况，且动作描写为一整个段落没有换行，例如：咕咕白调整了一下坐姿，拿起手机，发送了一条消息。)：\n`)[1];
+        let sendoutput = output.split(`于是我看到消息后做了如下动作(只有我自己的身体动作情况，且动作描写为一整个段落没有换行，例如：${characterName}调整了一下坐姿，拿起手机，发送了一条消息。)：\n`)[1];
         if (config.show_Action) {
             await session.send(`动作：\n${sendoutput}`)
         }
@@ -926,15 +1126,15 @@ ${IntThink}
 }
 
 //闲置高活跃
-async function recall(url, character, sessionId, history, session, config, ctx, OldstateData, message, userName) {
+async function recall(url, character, sessionId, speakerId, history, session, config, ctx, OldstateData, message, userName, summarize, characterName) {
     const Time = getTime();
     const pastminutes = millisecondsToMinutes(config.Short_term_active)
     let remind = `以下是系统消息，并非用户发出的信息：
 当前时间：${Time}
 距离上一次交流已经过去了${pastminutes}分钟。
-用户并未发送任何信息
+${userName}并未发送任何信息
 请你输出你的内心思考`
-    let remind2 = `我是咕咕白，是一个女大学生。
+    let remind2 = `${summarize}
 当前穿着：${OldstateData.clothes}
 当前位置：${OldstateData.location}
 当前心情：${OldstateData.emotion}
@@ -965,15 +1165,15 @@ async function recall(url, character, sessionId, history, session, config, ctx, 
             await session.send(`内心思想：${sendoutput}`);
         }
         //计算状态栏
-        let NewstateData = await status_bar(url, character, history, message, userName, '无意图', sendoutput, OldstateData, config, session);
+        let NewstateData = await status_bar(url, character, history, remind, userName, '无意图', sendoutput, OldstateData, config, session,'无动作');
 
         //重组状态栏
-        let remind3 = `我是咕咕白，是一个女大学生。
-当前穿着：${NewstateData.clothes}
-当前位置：${NewstateData.location}
-当前心情：${NewstateData.emotion}
-当前好感度：${NewstateData.favorability}
-与对话者的关系：${NewstateData.relationship}
+        let remind3 = `${summarize}
+当前穿着：${NewstateData.穿着}
+当前位置：${NewstateData.位置}
+当前心情：${NewstateData.心情}
+当前好感度：${NewstateData.好感度}
+与对话者的关系：${NewstateData.与对话者的关系}
 以下是我看到消息后的内心思考：
 ${sendoutput}
 是否需要主动开启对话(是或否)？
@@ -1006,9 +1206,9 @@ ${sendoutput}
             if (sendoutput2.includes("是")) {
 
                 //计算动作
-                let Action = await action(url, character, history, message, '无意图', sendoutput, session, config, OldstateData)
+                let Action = await action(url, character, history, remind, '无意图', sendoutput, session, config, OldstateData, summarize, characterName)
 
-                let selectTrue = `我是咕咕白，是一个女大学生。
+                let selectTrue = `${summarize}
 当前穿着：${NewstateData.clothes}
 当前位置：${NewstateData.location}
 当前心情：${NewstateData.emotion}
@@ -1037,21 +1237,8 @@ ${Action}
                 let sendoutput3 = output3.split(`以下是我选择使用的开启对话的询问：\n`)[1];
                 //删除干扰
                 sendoutput3 = sendoutput3.replace(/[：:“”‘’"\n\\]/g, '');
-                // 分开发送
-                let sentences = splitParagraph(sendoutput3)
-                const maxInterval = 2000; // 最大间隔时间
-                if (sentences.length === 1) {
-                    session.send(sentences[0]);
-                } else {
-                    for (let i = 0; i < sentences.length; i++) {
-                        if (sentences[i].trim() !== "") {
-                            let delay = i === 0 ? 0 : Math.min(sentences.slice(0, i).reduce((sum, sentence) => sum + sentence.length * 130, 0), maxInterval * i);
-                            ctx.setTimeout(() => {
-                                session.send(sentences[i]);
-                            }, delay);
-                        }
-                    }
-                }
+                //发送回复
+                await handleOutput(session, sendoutput3, config, ctx, speakerId);
 
                 //历史记录更新
                 let Newhistory = getHistory(sessionId);
@@ -1079,13 +1266,94 @@ ${Action}
     }
 }
 
+//闹钟recall
+async function Alarmrecall(url, character, sessionId, speakerId, history, session, config, ctx, OldstateData, message, userName, summarize, characterName) {
+    const Time = getTime();
+    let remind = `以下是系统消息，并非用户发出的信息：
+当前时间：${Time}
+预定的提醒时间到了
+${userName}并未发送任何信息
+请你输出你的内心思考`
+    let remind2 = `${summarize}
+当前穿着：${OldstateData.clothes}
+当前位置：${OldstateData.location}
+当前心情：${OldstateData.emotion}
+当前好感度：${OldstateData.favorability}
+与对话者的关系：${OldstateData.relationship}
+以下是我看到消息后的内心思考(内心思考为一整个段落没有换行)：
+我应该提醒`
+    let fullinput = character.concat(history);
+    fullinput.push({ "role": "user", "content": remind })
+    fullinput.push({ "role": "assistant", "content": remind2 })
+    //准备request
+    const customRequest = {
+        "messages": fullinput,
+        "continue_": true,
+        "stop": ["以下是", "：", ":", "\n"],
+        "max_tokens": 200,
+    };
+    const request = createRequestBody(config, customRequest)
+    //post request
+    let response = await axios.post(url, request);
+    let output = response.data.choices[0].message.content.replace(/\n\s*\n/g, '\n');
+    let sendoutput = output.split(`以下是我看到消息后的内心思考(内心思考为一整个段落没有换行)：`)[1];
+
+    if (config.InternalThinking) {
+        await session.send(`内心思想：${sendoutput}`);
+    }
+    //计算状态栏
+    let NewstateData = await status_bar(url, character, history, remind, userName, '预定的提醒时间到了', sendoutput, OldstateData, config, session);
+
+    //计算动作
+    let Action = await action(url, character, history, remind, '预定的提醒时间到了', sendoutput, session, config, OldstateData, summarize, characterName,'无动作')
+
+    let selectTrue = `${summarize}
+当前穿着：${NewstateData.穿着}
+当前位置：${NewstateData.位置}
+当前心情：${NewstateData.心情}
+当前好感度：${NewstateData.好感度}
+与对话者的关系：${NewstateData.与对话者的关系}
+以下是我看到消息后的内心思考：
+${sendoutput}
+以下是我看到消息后做出的动作：
+${Action}
+以下是我选择使用提醒${userName}时间到了的回答：
+时间`
+    fullinput.pop();
+    fullinput.push({ "role": "assistant", "content": selectTrue });
+    //准备request
+    const customRequest3 = {
+        "messages": fullinput,
+        "continue_": true,
+        "max_tokens": 200,
+    };
+    const request3 = createRequestBody(config, customRequest3)
+    //post request
+    let response3 = await axios.post(url, request3);
+    let output3 = response3.data.choices[0].message.content.replace(/\n\s*\n/g, '\n');
+
+    //发送开始对话
+    let sendoutput3 = output3.split(`以下是我选择使用提醒${userName}时间到了的回答：\n`)[1];
+    //删除干扰
+    sendoutput3 = sendoutput3.replace(/[：:“”‘’"\n\\]/g, '');
+    //发送回复
+    await handleOutput(session, sendoutput3, config, ctx, speakerId);
+
+    //历史记录更新
+    let Newhistory = getHistory(sessionId);
+    Newhistory.push({ "role": "user", "content": `以下是系统消息，并非用户发出的信息：\n当前时间：${Time}，预定的提醒时间到了，用户并未发送任何信息。` });
+    Newhistory.push({ "role": "assistant", "content": `以下是我的心里活动：` + sendoutput + `以下是我选择使用的开启对话的询问：` + sendoutput3 });
+    saveHistory(sessionId, Newhistory);
+    saveState(sessionId, Time, NewstateData, '无意图', sendoutput, Action);
+}
+
 
 //5分钟闲置高活跃
-async function FiveRecall(ctx, delay, url, character, sessionId, history, session, config, maxCount, OldstateData, message, userName) {
+async function FiveRecall(ctx, delay, url, character, sessionId, speakerId, history, session, config, maxCount, OldstateData, message, userName, summarize, characterName) {
     let recallCount = 0;   // 重置计数器
     const interval = ctx.setInterval(() => {
         recallCount++;
-        recall(url, character, sessionId, history, session, config, ctx, OldstateData, message, userName);
+        recall(url, character, sessionId, speakerId, history, session, config, ctx, OldstateData, message, userName, summarize, characterName);
         if (recallCount >= maxCount) {
             interval();  // 停止计时器
             userTimers.delete(sessionId); 
@@ -1099,6 +1367,342 @@ async function FiveRecall(ctx, delay, url, character, sessionId, history, sessio
         userTimers.delete(sessionId);  // 从 Map 中删除该用户的计时器
     };
 }
+
+//工具调用
+async function ToolMessage(ctx, url, config, session, message, IntThink, Action, character, sessionId, speakerId, history, OldstateData, userName, summarize, characterName) {
+    let Time = getTime();
+    let timeWithoutSeconds = Time.replace(/:\d{2}$/, '');
+    let UseTool = getCharacter('Tools', 'buildincharacters');
+    const Message = `这里是你需要判断B的意图，并决定工具调用的文本：
+当前时间：${timeWithoutSeconds}
+A说的话：${message}
+B的内心思考：${IntThink}
+B的内心思考：${Action}`;
+    UseTool.push({ "role": "user", "content": Message });
+    //准备request
+    const customRequest = {
+        "messages": UseTool,
+        "temperature": 0.3,
+        "max_tokens": 50,
+        "stop": ["\n"],
+    };
+    const request = createRequestBody(config, customRequest)
+    //post request and get output
+    let response = await axios.post(url, request);
+    let Tool_use = response.data.choices[0].message.content;
+    if (config.UseTool_reply) {
+        await session.send(Tool_use);
+    }
+
+    //解析
+    const regex = /\[([^\]=]+)(?:=([^\]]+))?\]/g;
+    let match;
+    let Tools = {};
+    while ((match = regex.exec(Tool_use)) !== null) {
+        let key = match[1];
+        let value = match[2] !== undefined ? match[2] : key;
+        Tools[key] = value;
+    }
+
+    //准备
+    let Weather_info = '';
+    let Search_info = '';
+    let Alarm_Clock = '';
+
+    //调用
+    if (Tools.Weather) {
+        const cityName = Tools.Weather;
+        const weather = await getWeather(ctx, session, config, cityName);
+        Weather_info = `调用天气工具获得的${cityName}天气为：\n` + weather;
+    }
+
+    if (Tools.Search) {
+        const keywords = config.search_keywords;
+        const dangerous_keywords = config.dangerous_search_keywords;
+        const question = Tools.Search;
+        //包涵keywords
+        if (keywords.some(keyword => message.includes(keyword))) {
+            //屏蔽词
+            if (dangerous_keywords !== '' &&dangerous_keywords.some(keyword => question.includes(keyword))) {
+                await session.send(`检索问题包含禁止项目，请重新考虑提问方式！搜索已禁用！`);
+                Search_info = `检索问题包含禁止项目，请重新考虑提问方式！搜索已禁用！`;
+            } else {
+                const search = await searchWeb(ctx, session, config, question);
+                Search_info = `调用搜索引擎检索："${question}"\n获得如下参考与相关链接：\n${search}`;
+            }
+        }
+    }
+
+    if (Tools.Set_Alarm_Clock) {
+        const id = sessionId + '-' + Tools.Set_Alarm_Clock;
+        setAlarm(id, Tools.Set_Alarm_Clock, () => {
+            Alarmrecall(url, character, sessionId, speakerId, history, session, config, ctx, OldstateData, message, userName, summarize, characterName);
+        });
+        Alarm_Clock = `设定了${Tools.Set_Alarm_Clock}的闹钟`
+    }
+
+    if (Tools.Del_Alarm_Clock) {
+        const id = sessionId + '-' + Tools.Del_Alarm_Clock;
+        cancelAlarm(id)
+        Alarm_Clock = `删除了${Tools.Set_Alarm_Clock}的闹钟`
+    }
+
+    if (Tools.Del_All_Alarm_Clock) {
+        cancelUserAlarms(sessionId)
+        Alarm_Clock = `删除了所有闹钟`
+    }
+
+    //组成prompt
+    let combinedInfo = '';
+    if (Weather_info !== '') {
+        combinedInfo += Weather_info + '\n';
+    }
+    if (Search_info !== '') {
+        combinedInfo += Search_info + '\n';
+    }
+    if (Alarm_Clock !== '') {
+        combinedInfo += Alarm_Clock + '\n';
+    }
+    combinedInfo = combinedInfo.trim();
+    if (combinedInfo.length === 0) {
+        combinedInfo = "无";
+    }
+
+    if (config.UseTool_fullreply && combinedInfo !== "无") {
+        await session.send(`工具返回消息:${combinedInfo}`);
+    }
+    return combinedInfo
+}
+
+//读取城市id
+function loadCityIds(filePath) {
+    const cityIdMap = {};
+    const data = fs.readFileSync(filePath, 'utf-8');
+    const lines = data.split('\n');
+
+    lines.forEach(line => {
+        const [id, city] = line.split('=');
+        if (id && city) {
+            cityIdMap[city.trim()] = id.trim();
+        }
+    });
+
+    return cityIdMap;
+}
+
+//读取天气
+async function getWeather(ctx, session, config, cityName) {
+    const cityIdMap = loadCityIds(path.join(__dirname, 'Tools', 'cityid.txt'));
+    const cityId = cityIdMap[cityName];
+
+    if (!cityId) {
+        await session.send(`未找到城市 ${cityName} 的ID`);
+        return `无法查询到${cityName}对应的城市id，天气工具调用失败。`;
+    }
+    try {
+        const response = await ctx.http.get(`http://t.weather.itboy.net/api/weather/city/${cityId}`);
+        if (response.status === 200) {
+            const data = response;
+            //天气数据
+            const todayWeather = data.data;
+            const cityInfo = data.cityInfo;
+            const shidu = todayWeather.shidu;
+            const pm25 = todayWeather.pm25;
+            const pm10 = todayWeather.pm10;
+            const quality = todayWeather.quality;
+            const wendu = todayWeather.wendu;
+            const ganmao = todayWeather.ganmao;
+            return `天气查询结果：城市：${cityInfo.city}\n湿度：${shidu}\nPM2.5：${pm25}\nPM10：${pm10}\n空气质量：${quality}\n温度：${wendu}\n温馨提示：${ganmao}`;
+        } else {
+            if (config.UseTool_reply) {
+                await session.send('天气工具调用失败，数据请求失败');
+            }
+            console.log('天气工具调用失败，数据请求失败');
+            return '天气工具调用失败';
+        }
+    } catch (error) {
+        if (config.UseTool_reply) {
+            await session.send('API请求出错:' + error);
+        }
+        console.log('API请求出错:' + error);
+        return '天气工具调用失败';
+    }
+}
+
+//网页截图
+async function captureScreenshot(ctx, url, options = {}) {
+    const { selector, full, viewport, maxSize, loadTimeout = 30000, idleTimeout = 30000, proxy } = options;
+    const page = await ctx.puppeteer.page();
+    let loaded = false;
+    page.on('load', () => loaded = true);
+
+    try {
+        if (proxy) {
+            const agent = new HttpsProxyAgent.HttpsProxyAgent(proxy);
+            await page.setRequestInterception(true);
+            page.on('request', request => {
+                request.continue({
+                    agent
+                });
+            });
+        }
+
+        if (viewport) {
+            const [width, height] = viewport.split('x').map(Number);
+            await page.setViewport({ width, height });
+        }
+
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                return loaded
+                    ? resolve()
+                    : reject(new Error('navigation timeout'));
+            }, loadTimeout);
+
+            page.goto(url, {
+                waitUntil: 'networkidle0',
+                timeout: idleTimeout,
+            }).then(() => {
+                clearTimeout(timer);
+                resolve();
+            }).catch((error) => {
+                clearTimeout(timer);
+                reject(error);
+            });
+        });
+        if (selector) {
+            await page.waitForSelector(selector, { timeout: idleTimeout });
+        }
+        const shooter = selector ? await page.$(selector) : page;
+        if (!shooter) {
+            console.error('找不到满足该选择器的元素', selector);
+            throw new Error('Element not found.');
+        }
+        let buffer = await shooter.screenshot({ fullPage: full });
+        if (buffer.byteLength > maxSize) {
+            const data = pngjs.PNG.sync.read(buffer);
+            const width = data.width;
+            const height = Math.round(data.height * maxSize / buffer.byteLength);
+            const png = new pngjs.PNG({ width, height });
+            data.bitblt(png, 0, 0, width, height, 0, 0);
+            buffer = pngjs.PNG.sync.write(png);
+        }
+        await page.close();
+        return buffer;
+    } catch (error) {
+        console.error('截图失败:', error);
+        await page.close();
+        throw error;
+    }
+}
+
+//取前三条链接
+function getTopThreeResults($, results, question) {
+    const searchResults = [];
+    let Search_Count = 0;
+    results.each((i, result) => {
+        if (Search_Count >= 3) return false;
+        const titleTag = $(result).find('h3');
+        const urlTag = $(result).find('a');
+
+        if (titleTag.length && urlTag.length) {
+            const title = titleTag.text();
+            const url = urlTag.attr('href');
+            searchResults.push(`标题：${title} URL：${url}`);
+            Search_Count++;
+        } else {
+            console.log(`缺少标题或URL链接地址: ${$(result).html()}`);
+        }
+    });
+    return searchResults.join('\n');
+}
+
+//搜索并读取网页URL
+async function searchWeb(ctx, session, config, question) {
+    const headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.104 Safari/537.36"
+    };
+    // 设置代理，默认Clash
+    const proxy = config.Google_Proxy;
+    const agent = new HttpsProxyAgent.HttpsProxyAgent(proxy);
+    try {
+        const response = await axios.get(`https://www.google.com/search?hl=zh-CN&q=${question}`, {
+            headers,
+            httpsAgent: agent
+        });
+        if (response.status !== 200) {
+            console.log(response)
+            throw new Error("无法连接到google");
+        }
+        const $ = cheerio.load(response.data);
+        // 获取所有搜索结果
+        const searchResults = [];
+        const results = $('.tF2Cxc');
+
+        if (results.length === 0) {
+            console.log(`没有检索到相关内容:${response}`);
+            return `没有检索到相关内容，检索条目:${question}`;
+        }
+        //找维基百科链接
+        let wikipediaURL = null;
+        results.each((i, result) => {
+            const urlTag = $(result).find('a');
+            if (urlTag.length) {
+                const url = urlTag.attr('href');
+                if (url.includes('zh.wikipedia.org')) {
+                    wikipediaURL = url;
+                    return false; //第一个维基百科
+                }
+            }
+        });
+
+        if (wikipediaURL) {
+            try {
+                const wikiResponse = await axios.get(wikipediaURL, {
+                    headers,
+                    httpsAgent: agent
+                });
+                if (wikiResponse.status !== 200) {
+                    throw new Error("无法连接到维基百科");
+                }
+                const $wiki = cheerio.load(wikiResponse.data);
+                const contentDiv = $wiki('div.mw-content-ltr.mw-parser-output');
+                let firstParagraph = contentDiv.find('> p').first().text(); // 获取主目录下的第一个<p>
+                //移除引用
+                firstParagraph = firstParagraph.replace(/\[\d+\]/g, '');
+
+                if (config.UseTool_Picture) {
+                    //截图
+                    try {
+                        const buffer = await captureScreenshot(ctx, wikipediaURL, {
+                            full: false,
+                            viewport: '1024x768',
+                            maxSize: 5000000,// 5MB
+                            proxy: config.Google_Proxy
+                        });
+                        await session.send(koishi_1.h.image(buffer, 'image/png'));
+                    } catch (error) {
+                        console.error('截图失败:', error);
+                    }
+                }
+                //返回具体简介
+                return `维基百科简介：${firstParagraph}  来源链接：${wikipediaURL}`;
+            } catch (error) {
+                console.error('维基百科检索出错Error:', error);
+                //返回前三条搜索结果
+                return getTopThreeResults($, results, question);
+            }
+        } else {
+            //返回前三条搜索结果
+            return getTopThreeResults($, results, question);
+        }
+
+    } catch (error) {
+        console.error('检索出错Error:', error);
+        return `检索出错，无法连接到Google，检索条目:${question}`;
+    }
+}
+
 
 //长期记忆
 async function archive(url, archives, NameA, NameB, sessionId, config,session) {
@@ -1151,8 +1755,7 @@ async function archive(url, archives, NameA, NameB, sessionId, config,session) {
 //用户message打标
 async function labeling(url, message, history, config, NameA, NameB) {
     let character = getCharacter('labeling', 'buildincharacters');
-    let labhistory = history;
-    labhistory.push({ "role": "user", "content": message })
+    let labhistory = history.concat({ "role": "user", "content": message });
 
     // 限制长度
     if (labhistory.length > 5) {
@@ -1198,7 +1801,7 @@ async function compareTags(id, tag) {
             const maxLength = Math.max(len1, tags.length);
             const similarity = (1 - distance / maxLength) * 100;
 
-            if (similarity > 50) {
+            if (similarity > 40) {
                 archivesArray.push(memoryData[key].archives);
             }
         }
@@ -1206,6 +1809,55 @@ async function compareTags(id, tag) {
 
     return archivesArray;
 }
+
+//发送文本
+async function sendText(session, output, config, ctx) {
+    let sentences = splitParagraph(output);
+    const maxInterval = 2000; // 最大间隔时间
+
+    if (sentences.length === 1) {
+        session.send(sentences[0]);
+    } else {
+        for (let i = 0; i < sentences.length; i++) {
+            if (sentences[i].trim() !== "") {
+                let delay = i === 0 ? 0 : Math.min(sentences.slice(0, i).reduce((sum, sentence) => sum + sentence.length * 130, 0), maxInterval * i);
+                ctx.setTimeout(() => {
+                    session.send(sentences[i]);
+                }, delay);
+            }
+        }
+    }
+}
+
+//发送音频
+async function sendVoice(session, output, config, speakerId) {
+    if (output.length > config.ttsmaxlength) {
+        return `文本过长，tts生成失败`;
+    } else {
+        let url = config.bertorvits
+            ? `${config.ttsurl}/voice/bert-vits2?text=${encodeURIComponent(output)}&id=${speakerId}&format=${config.ttsformat}&lang=${config.ttslanguage}&length=${config.ttsspeechlength}&emotion=${config.ttsemotion}`
+            : `${config.ttsurl}/voice/vits?text=${encodeURIComponent(output)}&id=${speakerId}&format=${config.ttsformat}&lang=${config.ttslanguage}&length=${config.ttsspeechlength}`;
+
+        const response = await axios.get(url, { responseType: 'arraybuffer' });
+        return koishi_1.h.audio(response.data, 'audio/mpeg');
+    }
+}
+
+//处理output
+async function handleOutput(session, output, config, ctx, speakerId) {
+    if (config.outputMode == 'text' || config.outputMode == 'both' || config.outputMode == 'extra') {
+        await sendText(session, output, config, ctx);
+    }
+
+    if (config.outputMode == 'voice' || config.outputMode == 'both') {
+        await session.execute(`${config.ttscommand} ${output}`);
+    }
+
+    if (config.outputMode == 'extra') {
+        return await sendVoice(session, output, config, speakerId);
+    }
+}
+
 
 
 //主逻辑
@@ -1218,8 +1870,10 @@ async function apply(ctx, config) {
                 await session.execute(`help knj`)
                 return
             }
+            //各种参数
             let message = msg.join(' ');
             let Time = getTime();
+            let Tool = '无';
             let channelId = '';
             let userId = '';
             let characterName = '';
@@ -1256,6 +1910,7 @@ async function apply(ctx, config) {
             let character = getCharacter(characterName, 'characters');
             //加载旧状态文件
             let OldstateData = getState(sessionId);
+            let summarize = (getOriginStates(characterName)).summarize;
 
             //长期记忆
             if (history.length >= config.historyLimit + 10) {
@@ -1265,11 +1920,9 @@ async function apply(ctx, config) {
                 await archive(url, archives, userName, characterName, sessionId, config,session);
             }
 
-            //---------------------------------------思维链---------------------------------------------
-
             //用户输入打标
             let messagelabel = await labeling(url, message, history, config, userName, characterName);
-            if (config.messagelabe) {
+            if (config.messagelabel) {
                 session.send(messagelabel);
             }
 
@@ -1284,18 +1937,23 @@ async function apply(ctx, config) {
             }
 
             //内心思考
-            let IntThink = await InternalThinking(url, character, history, message, IntJudge, session, config, OldstateData);
+            let IntThink = await InternalThinking(url, character, history, message, IntJudge, session, config, OldstateData, summarize);
 
             //计算动作
-            let Action = await action(url, character, history, message, IntJudge, IntThink, session, config, OldstateData);
+            let Action = await action(url, character, history, message, IntJudge, IntThink, session, config, OldstateData, summarize, characterName);
 
             //计算状态变化
-            let NewstateData = await status_bar(url, character, history, message, userName, IntJudge, IntThink, OldstateData, config, session);
+            let NewstateData = await status_bar(url, character, history, message, userName, IntJudge, IntThink, OldstateData, config, session, summarize,Action);
+
+            //工具调用
+            if (config.UseTool) {
+                Tool = await ToolMessage(ctx, url, config, session, message, IntThink, Action, character, sessionId, speakerId, history, OldstateData, userName, summarize, characterName);
+            }
 
             //准备input内容
             let usermessage = { "role": "user", "content": message };
             let AImessage = {
-                "role": "assistant", "content": `我是咕咕白，是一个女大学生。
+                "role": "assistant", "content": `${summarize}
 当前时间：${Time}
 当前穿着：${NewstateData.穿着}
 当前位置：${NewstateData.位置}
@@ -1308,7 +1966,9 @@ ${IntJudge}
 ${IntThink}
 以下是我看到消息后做出的动作：
 ${Action}
-以下是我看到消息后，综合考虑上下文分析和内心思考，做出的回答：
+工具调用：
+${Tool}
+以下是我看到消息后，综合考虑上下文分析和内心思考，做出的回答(如果上面已经回答过了，那就在这里重复一遍)：
 `};
             let TimeHistory = getTimeHistory(sessionId);
             TimeHistory.push(usermessage);
@@ -1317,7 +1977,7 @@ ${Action}
             //判断是否读取长期记忆
             if (Memorys != []) {
                 let addMemorys = Memorys.join('\n');
-                character.push({ "role": "user", "content": `以下是我回忆起的更早之前的记忆：\n${addMemorys}` })
+                character.push({ "role": "assistant", "content": `以下是我回忆起的更早之前的记忆：\n${addMemorys}` })
             }
 
             //连接人设与历史记录与用户输入
@@ -1335,37 +1995,28 @@ ${Action}
             //处理
             if (response.status == 200) {
                 let fulloutput = response.data.choices[0].message.content.replace(/\n\s*\n/g, '\n');
-                let output = fulloutput.split(`以下是我看到消息后，综合考虑上下文分析和内心思考，做出的回答：\n`)[1];
+                let output = fulloutput.split(`以下是我看到消息后，综合考虑上下文分析和内心思考，做出的回答(如果上面已经回答过了，那就在这里重复一遍)：\n`)[1];
                 //删除干扰
-                output = output.replace(/[：:“”‘’"\n\\]/g, '');
+                output = output.replace(/[「」：:“”‘’"\n\\]/g, '');
                 //写入历史记录
                 history.push({ "role": "user", "content": message });
                 history.push({ "role": "assistant", "content": output });
                 saveHistory(sessionId, history);
                 saveState(sessionId, Time, NewstateData, IntJudge, IntThink,Action);
 
-                // 分开发送
-                let sentences = splitParagraph(output)
-                const maxInterval = 2000; // 最大间隔时间
-                if (sentences.length === 1) {
-                    session.send(sentences[0]);
-                } else {
-                    for (let i = 0; i < sentences.length; i++) {
-                        if (sentences[i].trim() !== "") {
-                            let delay = i === 0 ? 0 : Math.min(sentences.slice(0, i).reduce((sum, sentence) => sum + sentence.length * 130, 0), maxInterval * i);
-                            ctx.setTimeout(() => {
-                                session.send(sentences[i]);
-                            }, delay);
-                        }
-                    }
+                //发送回复
+                await handleOutput(session, output, config, ctx, speakerId);
+
+                //表情包
+                if (config.UseEmoji) {
+                    await EmojiJudge(url, message, output, config, session);
                 }
 
-                //---------------------------------------五分钟recall---------------------------------------------
                 if (userTimers.has(sessionId)) {
                     const { stopTimer } = userTimers.get(sessionId);
                     stopTimer();  // 停止之前的计时器
                 }
-                const stopTimer = await FiveRecall(ctx, config.Short_term_active, url, character, sessionId, history, session, config, config.Short_term_active_times, OldstateData, message, userName);
+                const stopTimer = await FiveRecall(ctx, config.Short_term_active, url, character, sessionId, speakerId, history, session, config, config.Short_term_active_times, OldstateData, message, userName, summarize, characterName);
                 userTimers.set(sessionId, { stopTimer, recallCount: 0 });
 
             } else {
@@ -1398,7 +2049,7 @@ ${Action}
             createState(sessionId);
             createMemory(sessionId);
             const time = getTime();
-            writeState(sessionId, character, time);
+            writeBaseState(sessionId, character, time);
 
             if (config.select_character_notice) {
                 return `人设 ${character} 已加载，新的历史记录已创建,语音角色已绑定为${config.ttsspeakerID}。`;
@@ -1419,6 +2070,7 @@ ${Action}
                 const { stopTimer } = userTimers.get(sessionId);
                 stopTimer();  // 停止之前的计时器
             }
+            cancelUserAlarms(sessionId)// 停止闹钟
             const fileToDelete = await CheckSessionFile(session, config);
             if (!fileToDelete) {
                 return `没有找到匹配的历史记录文件。`
@@ -1456,12 +2108,13 @@ ${Action}
                 const { stopTimer } = userTimers.get(sessionId);
                 stopTimer();  // 停止之前的计时器
             }
+            cancelUserAlarms(sessionId)// 停止闹钟
             const file = await CheckSessionFile(session, config);
             if (file) {
                 fs.writeFileSync(`${__dirname}/sessionData/${file}`, '[]');
                 fs.writeFileSync(`${__dirname}/longtermmemory/${safeId}-memory.json`, '{}');
                 const time = getTime()
-                writeState(sessionId, characterName, time);
+                writeBaseState(sessionId, characterName, time);
                 return `已重置历史记录文件：\n${decodeURIComponent(file)}`;
             } else {
                 return `没有找到匹配的历史记录文件。\n 当前id:${session.channelId.toString().replace(/-/g, '')} \n ${session.userId.toString()}`;
@@ -1502,11 +2155,108 @@ ${Action}
         .alias("人设列表")
         .action(async () => {
             let files = fs.readdirSync(`${__dirname}/characters/`);
+            files = files.filter(file => !file.endsWith('state.json'));
             if (files.length === 0) {
                 return '目前没有可用的人设文件。';
             } else {
                 let characterNames = files.map(file => file.replace('.json', ''));
                 return '可用的人设有：\n' + characterNames.join('\n');
+            }
+        });
+
+    //档案列表
+    ctx.command("knj.arclist", ":\n(别名：档案列表)\n列出所有你曾经存储的角色")
+        .alias("档案列表")
+        .action(async ({ session }) => {
+            let archivePath = config.Archive_Path !== '' ? config.Archive_Path : `${__dirname}/Archive/`;
+            let files = fs.readdirSync(archivePath);
+            files = files
+                .map(file => decodeURIComponent(file))
+                .filter(file => !file.endsWith('state.json') && !file.endsWith('memory.json'))
+                .filter(file => file.startsWith(`${session.channelId}-${session.userId}`));
+            if (files.length === 0) {
+                return '目前没有存储的角色。';
+            } else {
+                let characterNames = files.map(file => file.replace('.json', ''));
+                return '你存储的角色有：\n' + characterNames.join('\n');
+            }
+        });
+
+    //档案存储
+    ctx.command("knj.arc", ":\n(别名：档案存储)\n将现在和你对话的角色存入档案")
+        .alias("档案存储")
+        .action(async ({ session }) => {
+            let archivePath = config.Archive_Path !== '' ? config.Archive_Path : `${__dirname}/Archive/`;
+            if (!fs.existsSync(archivePath)) {
+                await session.send('外置档案存储目录不存在，请修改');
+                return
+            }
+            //检查文件获取名称
+            const file = await CheckSessionFile(session, config);
+            //检查archive内是否已经存在
+            if (fs.existsSync(`${archivePath}${file}`)) {
+                session.send(`在档案文件夹内找到了同名角色，请不要重复存储。`)
+                return
+            }
+
+            //创建sessionid
+            let sessionData = await getSessionData(session, config);
+            let characterName = sessionData.characterName;
+            let speakerId = sessionData.speakerId;
+            let sessionId = await buildSessionId(session, config, characterName, speakerId);
+
+            if (userTimers.has(sessionId)) {
+                const { stopTimer } = userTimers.get(sessionId);
+                stopTimer();  // 停止之前的计时器
+            }
+            cancelUserAlarms(sessionId)// 停止闹钟
+
+            const rawfile = file.replace(/\.json$/, "");
+            if (file) {
+                fs.rename(`${__dirname}/sessionData/${file}`, `${archivePath}${file}`, (err) => { });
+                fs.rename(`${__dirname}/sessionData/${rawfile}-state.json`, `${archivePath}${rawfile}-state.json`, (err) => { });
+                fs.rename(`${__dirname}/longtermmemory/${rawfile}-memory.json`, `${archivePath}${rawfile}-memory.json`, (err) => { });
+                session.send(`档案存储完毕：${sessionId}`)
+            } else {
+                return `没有找到匹配的历史记录文件。\n 当前id:${session.channelId.toString().replace(/-/g, '')} \n userId:${session.userId.toString()}`;
+            }
+        });
+
+    //档案加载
+    ctx.command("knj.arcload <character:text>", ":\n(别名：档案加载)\n将档案内的指定角色读取出来")
+        .alias("档案加载")
+        .action(async ({ session }, character) => {
+            if (!character || character.trim() === "") {
+                await session.send(`请至少输入一个人设名称`);
+                await session.execute(`knj.arclist`);
+                return;
+            }
+            const filenow = await CheckSessionFile(session, config);
+            if (filenow !== "") {
+                await session.send('你现在正在聊天中，无法直接加载档案，请首先进行档案存储或删除。\n档案存储：knj.arc\n档案删除：knj.del');
+                return
+            }
+            let archivePath = config.Archive_Path !== '' ? config.Archive_Path : `${__dirname}/Archive/`;
+            let files = fs.readdirSync(archivePath);
+            files = files
+                .map(file => decodeURIComponent(file))
+                .filter(file => !file.endsWith('state.json') && !file.endsWith('memory.json'))
+                .filter(file => file.startsWith(`${session.channelId}-${session.userId}`));
+            if (files.length === 0) {
+                return '目前没有存储的档案。';
+            } else {
+                let characterNames = files.map(file => file.replace('.json', ''));
+                let rawfile = encodeURIComponent(character);
+                if (characterNames.includes(character)) {
+                    fs.rename(`${archivePath}${rawfile}.json`, `${__dirname}/sessionData/${rawfile}.json`, (err) => { });
+                    fs.rename(`${archivePath}${rawfile}-state.json`, `${__dirname}/sessionData/${rawfile}-state.json`, (err) => { });
+                    fs.rename(`${archivePath}${rawfile}-memory.json`, `${__dirname}/longtermmemory/${rawfile}-memory.json`, (err) => { });
+                    session.send(`档案读取完成：${character}`);
+                } else {
+                    session.send(`没有找到输入的档案名字：${character}`);
+                    await session.execute(`knj.arclist`);
+                    return 
+                }
             }
         });
 
@@ -1518,10 +2268,8 @@ ${Action}
         if (ctx.bots[session.uid])
             return;
         // @触发
-        if ((config.if_at && session.parsed.appel) && !session.quote) {
+        if (session.elements[0].type == "at" && session.elements[0].attrs.id === session.bot.selfId && !session.quote) {
             let msg = String(session.content);
-            msg = msg.replace(`<at id="${session.selfId}"/> `, '');
-            msg = msg.replace(`<at id="${session.selfId}"/>`, '');
             if (msg.indexOf(session.selfId)) {
                 msg = msg.replace(/<[^>]+>/g, '');
             }
@@ -1537,7 +2285,7 @@ ${Action}
             }
         }
         // 私聊触发
-        if (session.channelId == "private:" + String(session.userId) && config.if_private) {
+        if (session.isDirect === true && config.if_private) {
             let msg = String(session.content);
             if (msg.startsWith("[自动回复]")) {
                 return;
